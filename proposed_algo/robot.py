@@ -248,7 +248,6 @@ class Robot:
         """
         Returns the best next move (nx, ny) for coverage + expected reward
         """
-
         actions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
         n, m = self.n, self.m
 
@@ -258,6 +257,10 @@ class Robot:
         # Initialize visit count if not done
         if not hasattr(self, "visit_count"):
             self.visit_count = np.zeros((n, m), dtype=int)
+
+        # Ensure last_move exists for tie-break
+        if not hasattr(self, "last_move"):
+            self.last_move = (0, 0)
 
         # Count how many times each first-step action has been simulated
         n_a_dict = {}  # (nx, ny) -> number of simulations
@@ -274,33 +277,52 @@ class Robot:
 
             returns = []
             for _ in range(n_sim):
-                # Simulate the rollout
+                # --- start of rollout ---
                 sim_x, sim_y = nx, ny
+                sim_belief = copy.deepcopy(self.belief)  # local copy; global state untouched
                 cum_reward = 0.0
                 curr_discount = 1.0
 
-                # Optional: copy belief if needed for dirt reward
-                sim_belief = copy.deepcopy(self.belief)
-
                 for t in range(horizon):
-                    valid_moves = [(sim_x + adx, sim_y + ady) for adx, ady in actions
-                                   if 0 <= sim_x + adx < n and 0 <= sim_y + ady < m]
+                    # 1) ARRIVAL: sample observation from decayed belief (computed on-the-fly)
+                    p_dirty = float(sim_belief.expected_dirtiness(sim_x, sim_y))
+                    p_dirty = max(0.0, min(1.0, p_dirty))
+                    dirty_obs = (np.random.rand() < p_dirty)
+
+                    # 2) Reward for this step: cleaning if dirty, minus move cost
+                    step_reward = (self.reward_scale if dirty_obs else 0.0) - self.move_cost
+                    cum_reward += curr_discount * step_reward
+
+                    # 3) Belief update at this tile (rollout-local)
+                    #    NOTE: update() already does current_step += 1 and stamps last_visit
+                    sim_belief.update(sim_x, sim_y, 1 if dirty_obs else 0)
+
+                    # 4) Pick next move (if any) — use UPDATED belief
+                    valid_moves = []
+                    for adx, ady in actions:
+                        nnx, nny = sim_x + adx, sim_y + ady
+                        if 0 <= nnx < n and 0 <= nny < m:
+                            valid_moves.append((nnx, nny))
                     if not valid_moves:
                         break
 
-                    # Random next step in rollout
-                    sim_x, sim_y = valid_moves[np.random.choice(len(valid_moves))]
+                    # Weighted by current expected dirtiness (after the update)
+                    probs = np.array([sim_belief.expected_dirtiness(x, y) for (x, y) in valid_moves], dtype=float)
+                    probs = np.clip(probs, 0.0, 1.0)
+                    s = probs.sum()
+                    if s <= 1e-12:
+                        probs = np.full(len(valid_moves), 1.0 / len(valid_moves))
+                    else:
+                        probs /= s
+                    sim_x, sim_y = valid_moves[np.random.choice(len(valid_moves), p=probs)]
 
-                    # Reward: for coverage-only, could be 1 per new tile
-                    reward = self.reward_scale * sim_belief.expected_dirtiness(sim_x, sim_y)
-                    move_penalty = self.move_cost
-                    cum_reward += curr_discount * (reward - move_penalty)
                     curr_discount *= discount
+                # --- end of rollout ---
 
-                returns.append(cum_reward)
-                n_a_dict[(nx, ny)] += 1  # increment simulations for this first-step action
+                returns.append(cum_reward)  # ✅ record rollout return
+                n_a_dict[(nx, ny)] += 1  # ✅ record that we simulated this first action
 
-            mean_return = np.mean(returns)
+            mean_return = np.mean(returns) if returns else -np.inf
 
             # Visit bonus for coverage
             visit_bonus = alpha_visit / (1 + self.visit_count[nx, ny])
@@ -309,30 +331,36 @@ class Robot:
             cb_term = c_ucb * np.sqrt(np.log(total_actions + 1) / (n_a_dict[(nx, ny)] + 1e-5))
             ucb = mean_return + cb_term + visit_bonus
 
-            # add straight-line bias
+            # add straight-line bias (optional)
             # if (dx, dy) == self.last_move:
             #     ucb += 0.05
 
             action_stats.append((nx, ny, mean_return, ucb))
 
+        # Guard: in case no actions (shouldn't happen if grid valid)
+        if not action_stats:
+            return (self.x, self.y), (self.x, self.y, 0.0, 0.0)
+
         # Pick the action with highest UCB
         best = max(action_stats, key=lambda t: t[3])
 
         # Collect all actions within epsilon of best_score
-        candidates = [a for a in action_stats if abs(a[3] - best[3]) < 0.02]
+        eps = 0.02
+        candidates = [a for a in action_stats if abs(a[3] - best[3]) < eps] or [best]
+
         # Tie-breaker: prefer action in same direction as last_move
-        best = candidates[0]  # default if none matches
+        chosen = candidates[0]
         for a in candidates:
             if (a[0] - self.x, a[1] - self.y) == self.last_move:
-                best = a
+                chosen = a
                 break
 
-        best_action = (best[0], best[1])
+        best_action = (chosen[0], chosen[1])
 
-        #for straight line bias
+        # for straight line bias memory
         self.last_move = (best_action[0] - self.x, best_action[1] - self.y)
 
-        return best_action, best
+        return best_action, chosen
 
     def move_and_observe_mc(self, horizon=5, n_sim=50, discount=0.95):
         # nx, ny, exp_return = *self.monte_carlo_action(horizon, n_sim, discount)[0], 0

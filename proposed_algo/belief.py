@@ -23,17 +23,24 @@ class BeliefGrid:
         self.current_step +=  1
         self.last_visit[x, y] = self.current_step
 
-
     def evolve(self):
-        for i in range(self.rows):
-            for j in range(self.cols):
-                expected_dirtiness = self.alpha[i, j] / (self.alpha[i, j] + self.beta[i, j])
-                time_since = self.current_step - self.last_visit[i, j]
-                weight = 1 - np.exp(-time_since / self.decay_const)
-                self.current_belief[i, j] = weight * expected_dirtiness
+        e = self.alpha / (self.alpha + self.beta)
+        e[(self.alpha + self.beta) == 0] = 0.5
+        time_since = self.current_step - self.last_visit
+        time_since = np.maximum(time_since, 0)
+        weight = 1 - np.exp(-time_since / self.decay_const)
+        self.current_belief = weight * e
 
     def expected_dirtiness(self, x, y):
-        return self.current_belief[x, y]
+        # Compute decayed belief on the fly:
+        a = self.alpha[x, y]
+        b = self.beta[x, y]
+        e = (a / (a + b)) if (a + b) > 0 else 0.5
+        time_since = self.current_step - self.last_visit[x, y]
+        if time_since < 0:
+            time_since = 0
+        weight = 1 - np.exp(-time_since / self.decay_const)
+        return weight * e
 
     def visit_count(self, x, y):
         # Subtract prior for true observed count
