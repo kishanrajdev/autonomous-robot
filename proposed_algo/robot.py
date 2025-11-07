@@ -1,7 +1,7 @@
 import numpy as np
 import copy
 
-from monte_carlo_simple_cleaning import observe
+# from monte_carlo_simple_cleaning import observe
 
 
 class Robot:
@@ -9,8 +9,8 @@ class Robot:
         self.env = env
         self.belief = belief
         self.x, self.y = start
-        self.n = n
-        self.m = m
+        # after self.belief is set
+        self.n, self.m = self.belief.alpha.shape  # single source of truth
         self.move_cost = move_cost
         self.reward_scale = reward_scale
         self.total_reward = 0.0
@@ -362,24 +362,208 @@ class Robot:
 
         return best_action, chosen
 
+    def monte_carlo_action_ucb_adaptive(
+            self,
+            budget=200,  # total rollout budget (across all first-step actions)
+            base_horizon=5,
+            discount=0.95,
+            c_ucb=1.5,
+            eta_visit=1.0,  # visit shaping strength (potential-based)
+            eps=0.10,  # ε-greedy inside rollout
+            temp_minmax=(0.5, 2.0),  # softmax temperature bounds
+    ):
+        """
+        Monte-Carlo action selection with *adaptive* UCB allocation and low-variance rollouts.
+        Returns: ((nx, ny), (nx, ny, mean_return, ucb_score))
+        """
+        actions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+        n, m = self.n, self.m
+        if not hasattr(self, "visit_count"):
+            self.visit_count = np.zeros((n, m), dtype=int)
+        if not hasattr(self, "last_move"):
+            self.last_move = (0, 0)
+
+        # enumerate legal first-step actions
+        arms = []
+        for dx, dy in actions:
+            nx, ny = self.x + dx, self.y + dy
+            if 0 <= nx < n and 0 <= ny < m:
+                arms.append((nx, ny, dx, dy))
+        if not arms:
+            return (self.x, self.y), (self.x, self.y, 0.0, 0.0)
+
+        # per-arm stats
+        counts = {(nx, ny): 0 for (nx, ny, _, _) in arms}
+        means = {(nx, ny): 0.0 for (nx, ny, _, _) in arms}
+
+        # common random numbers: one RNG per arm for variance reduction
+        rngs = {(nx, ny): np.random.RandomState(hash((nx, ny, self.x, self.y)) & 0xFFFFFFFF)
+                for (nx, ny, _, _) in arms}
+
+        # precompute neighbor lists (speed)
+        def neighbors(x, y):
+            H, W = self.belief.alpha.shape
+            out = []
+            if x > 0:     out.append((x - 1, y))
+            if x + 1 < H: out.append((x + 1, y))
+            if y > 0:     out.append((x, y - 1))
+            if y + 1 < W: out.append((x, y + 1))
+            return out
+
+        # temperature from local uncertainty (Shannon entropy of Beta mean approx)
+        def local_temp(x, y):
+            p = float(self.belief.expected_dirtiness(x, y))
+            ent = -(p * np.log(p + 1e-12) + (1 - p) * np.log(1 - p + 1e-12))
+            tmin, tmax = temp_minmax
+            return tmin + (tmax - tmin) * np.clip(ent / np.log(2.0), 0.0, 1.0)
+
+        # potential-based shaping Φ(s) = η/(1+visit(x,y))
+        def phi(x, y):
+            return eta_visit / (1.0 + self.visit_count[x, y])
+
+        # One rollout from first-step (nx,ny); rollbackable belief updates (delta stack)
+        def simulate_from(nx, ny, rng):
+            # adaptive horizon by local uncertainty
+            horizon = int(round(base_horizon + 2 * local_temp(nx, ny)))
+            x, y = nx, ny
+
+            # small stacks of deltas to undo belief updates at the end
+            delta_stack = []  # items: (i,j, d_alpha, d_beta, last_visit_old)
+            cum = 0.0
+            γ = 1.0
+            last_dxdy = (nx - self.x, ny - self.y)
+
+            # cache Φ at start to compute shaped reward γΦ(s')-Φ(s)
+            phi_prev = phi(self.x, self.y)
+
+            for t in range(horizon):
+                # 1) observe dirty via Bernoulli(p) with CRN
+                p_dirty = float(self.belief.expected_dirtiness(x, y))
+                dirty_obs = (rng.rand() < p_dirty)
+
+                # 2) step reward (base)
+                step_r = (self.reward_scale if dirty_obs else 0.0) - self.move_cost
+
+                # 3) belief update at (x,y) with rollback bookkeeping
+                #    record old last_visit once; record Δα, Δβ
+                last_visit_old = self.belief.last_visit[x, y]
+                d_alpha = 1 if dirty_obs else 0
+                d_beta = 0 if dirty_obs else 1
+                self.belief.alpha[x, y] += d_alpha
+                self.belief.beta[x, y] += d_beta
+                self.belief.last_visit[x, y] = self.belief.current_step + t + 1
+                delta_stack.append((x, y, d_alpha, d_beta, last_visit_old))
+
+                # 4) shaped reward
+                phi_curr = phi(x, y)
+                shaped = step_r + discount * phi_curr - phi_prev
+                phi_prev = phi_curr
+
+                cum += γ * shaped
+
+                # 5) next move: ε-greedy over softmax of shaped “desirability”
+                nbrs = neighbors(x, y)
+                if not nbrs:
+                    break
+
+                # desirability: expected dirtiness + small same-direction bias + inverse visit
+                desir = []
+                temp = local_temp(x, y)
+                for (xx, yy) in nbrs:
+                    ed = float(self.belief.expected_dirtiness(xx, yy))
+                    sd = 0.05 if (xx - x, yy - y) == last_dxdy else 0.0
+                    iv = 1.0 / (1.0 + self.visit_count[xx, yy])
+                    desir.append(ed + 0.1 * iv + sd)
+                desir = np.array(desir, dtype=float)
+                desir = desir - desir.max()
+                probs = np.exp(desir / max(temp, 1e-3))
+                probs /= probs.sum()
+
+                if rng.rand() < eps:
+                    k = rng.randint(len(nbrs))
+                else:
+                    k = rng.choice(len(nbrs), p=probs)
+
+                x2, y2 = nbrs[k]
+                last_dxdy = (x2 - x, y2 - y)
+                x, y = x2, y2
+                γ *= discount
+
+            # rollback belief
+            for (i, j, da, db, lv_old) in reversed(delta_stack):
+                self.belief.alpha[i, j] -= da
+                self.belief.beta[i, j] -= db
+                self.belief.last_visit[i, j] = lv_old
+
+            return cum
+
+        # Initialization: one pull per arm (ensures nonzero counts)
+        for (nx, ny, _, _) in arms:
+            r = simulate_from(nx, ny, rngs[(nx, ny)])
+            counts[(nx, ny)] += 1
+            means[(nx, ny)] = r
+
+        # Adaptive UCB allocation until budget
+        total = len(arms)  # already did one each
+        while total < budget:
+            # compute UCB scores
+            logN = np.log(total + 1.0)
+            scores = []
+            for (nx, ny, _, _) in arms:
+                n = counts[(nx, ny)]
+                cb = c_ucb * np.sqrt(logN / n)
+                # add a light *static* visit encouragement only at root
+                score = means[(nx, ny)] + cb + eta_visit / (1.0 + self.visit_count[nx, ny])
+                scores.append((score, nx, ny))
+            _, ax, ay = max(scores, key=lambda t: t[0])
+
+            # one more rollout for the chosen arm
+            r = simulate_from(ax, ay, rngs[(ax, ay)])
+            n = counts[(ax, ay)]
+            means[(ax, ay)] = (means[(ax, ay)] * n + r) / (n + 1)
+            counts[(ax, ay)] = n + 1
+            total += 1
+
+        # choose best arm, tie-break same-direction
+        best_mean = max(((means[(nx, ny)], nx, ny) for (nx, ny, _, _) in arms), key=lambda t: t[0])
+        best_score = best_mean[0]
+        cands = [(nx, ny) for (nx, ny, _, _) in arms if abs(means[(nx, ny)] - best_score) < 1e-3] or [
+            (best_mean[1], best_mean[2])]
+
+        chosen = cands[0]
+        for (nx, ny) in cands:
+            if (nx - self.x, ny - self.y) == self.last_move:
+                chosen = (nx, ny);
+                break
+
+        self.last_move = (chosen[0] - self.x, chosen[1] - self.y)
+        ucb_dbg = max(score for (score, nx, ny) in scores if (nx, ny) == chosen)
+        return chosen, (chosen[0], chosen[1], means[chosen], ucb_dbg)
+
     def move_and_observe_mc(self, horizon=5, n_sim=50, discount=0.95):
         # nx, ny, exp_return = *self.monte_carlo_action(horizon, n_sim, discount)[0], 0
-        (nx, ny), exp_return = self.monte_carlo_action_ucb_3(horizon, n_sim, discount)
-
+        # (nx, ny), exp_return = self.monte_carlo_action_ucb_3(horizon, n_sim, discount)
+        # (nx, ny), exp_return = self.monte_carlo_action_ucb_adaptive(horizon, n_sim, discount)
+        (nx, ny), dbg = self.monte_carlo_action_ucb_adaptive(
+            budget=n_sim * 4,  # or whatever budget you prefer
+            base_horizon=horizon,
+            discount=discount
+        )
         self.x, self.y = nx, ny
         obs = self.env.observe(nx, ny)
         self.observe_and_clean(nx, ny)
         self.total_steps += 1
         return nx, ny, obs
 
-    def observe_and_clean(self, x, y):
-        obs = self.env.observe(x, y)
+    def observe_and_clean(self, x, y, obs=None):
+        if obs is None:
+            obs = self.env.observe(x, y)  # only read if caller didn't
         self.belief.update(x, y, obs)
         if obs == 1:
             self.env.clean_tile(x, y)
             immediate_reward = self.reward_scale
         else:
-            immediate_reward = 0
+            immediate_reward = 0.0
         self.total_reward += immediate_reward - self.move_cost
-        # Update visit count for chosen tile
         self.visit_count[x, y] += 1
+

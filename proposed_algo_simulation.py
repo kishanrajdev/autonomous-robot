@@ -16,7 +16,6 @@ with open('dirt_seeds.json', 'r') as file:
 env = GridEnvironment(n, m)
 belief = BeliefGrid(n, m)
 robot = Robot(env, belief, n, m)
-
 # --- Run episodes ---
 for episode in range(1, episodes + 1):
     step = 0
@@ -25,36 +24,51 @@ for episode in range(1, episodes + 1):
     robot.total_reward = 0.0
     robot.visit_count = np.zeros((n, m), dtype=int)
     robot.total_steps = 0
-    robot.x, robot.y = 0, 0  # reset start pos
+    robot.x, robot.y = 0, 0  # reset start
 
-    robot.observe_and_clean(0, 0)
-    visited[0, 0] = 1
-
-
-    # get dirty tiles_config from json data
-    dirty_tiles_config = [tuple(dirty_tile) for dirty_tile in data["episodes_regions"][episode - 1]]
-
+    # 1) Apply episode's initial dirt
+    dirty_tiles_config = [tuple(d) for d in data["episodes_regions"][episode - 1]]
     env.set_dirty_tiles(dirty_tiles_config)
 
-    # Track when dirty tiles are first reached
+    # 2) Initialize first-arrival tracker *before* any observation/clean
     dirty_tile_steps = {str(tile): None for tile in dirty_tiles_config}
 
-    path = [(robot.x, robot.y)]   # record path
+    # 3) Observe start tile once
+    start_obs = env.observe(0, 0)
+
+    # If start tile is configured dirty, record first arrival as step 0 (your convention)
+    if str((0, 0)) in dirty_tile_steps and start_obs == 1:
+        dirty_tile_steps[str((0, 0))] = 0
+
+    # 4) Update belief/env exactly once for the start tile
+    robot.observe_and_clean(0, 0, start_obs)
+    visited[0, 0] = 1
+
+    path = [(robot.x, robot.y)]
+
+    # Choose world model consistency
+    dynamic_world = True
 
     while not visited.all():
         x, y, obs = robot.move_and_observe_mc(horizon=10, n_sim=100, discount=0.9)
-        belief.evolve()
+
+        if dynamic_world:
+            # env.evolve(dirt_stay=0.9, dirt_new=0.05)
+            belief.evolve()
+
+        # Log belief snapshot
         save_belief_to_jsonl(belief, step, episode)
+
         visited[x, y] += 1
         path.append((x, y))
+
+        # If this tile was configured dirty and not yet recorded, set first-arrival time
+        if str((x, y)) in dirty_tile_steps and dirty_tile_steps[str((x, y))] is None and obs == 1:
+            # Use step+1 if your convention is "after the move"; otherwise keep step
+            dirty_tile_steps[str((x, y))] = step + 1
+
         step += 1
 
-        # record first step when a dirty tile is reached
-        tile = (x, y)
-        if str(tile) in dirty_tile_steps and dirty_tile_steps[str(tile)] is None:
-            dirty_tile_steps[str(tile)] = step
-
-    # --- Save episode data ---
     episode_info = {
         "episode": episode,
         "steps": step,
@@ -64,5 +78,5 @@ for episode in range(1, episodes + 1):
         "dirty_tile_steps": dirty_tile_steps
     }
     save_episode_info_to_jsonl(episode_info)
-
     print(f"Episode {episode} finished in {step} steps. Reward = {robot.total_reward:.2f}.")
+
