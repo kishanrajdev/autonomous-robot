@@ -307,6 +307,7 @@ class Robot:
                         break
 
                     # Weighted by current expected dirtiness (after the update)
+                    #  should simulate time? time progression
                     probs = np.array([sim_belief.expected_dirtiness(x, y) for (x, y) in valid_moves], dtype=float)
                     probs = np.clip(probs, 0.0, 1.0)
                     s = probs.sum()
@@ -362,15 +363,150 @@ class Robot:
 
         return best_action, chosen
 
+    def monte_carlo_action_ucb_3_fast(
+            self,
+            horizon=5,
+            n_sim=50,
+            discount=0.95,
+            c_ucb=1.5,  # ignored now (kept only to preserve signature)
+            alpha_visit=1.0,
+            rng=None
+    ):
+        """
+        Fast equal-rollout planner (UCB removed).
+        Score = mean_return + alpha_visit / (1 + visit_count[nx,ny]).
+        Returns: ((nx, ny), (nx, ny, mean_return, score))
+        """
+        import numpy as np
+
+        H, W = self.belief.alpha.shape
+        actions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+
+        if not hasattr(self, "visit_count"):
+            self.visit_count = np.zeros((H, W), dtype=int)
+        if not hasattr(self, "last_move"):
+            self.last_move = (0, 0)
+
+        # reproducible RNG if not provided
+        if rng is None:
+            rng = np.random.RandomState(
+                (int(self.belief.current_step) + 7)
+                ^ (self.x * 5011) ^ (self.y * 6971)
+            )
+
+        # neighbors (no allocations in inner loop)
+        def nbrs(x, y):
+            out = []
+            if x > 0:     out.append((x - 1, y))
+            if x + 1 < H:   out.append((x + 1, y))
+            if y > 0:     out.append((x, y - 1))
+            if y + 1 < W:   out.append((x, y + 1))
+            return out
+
+        # local expected dirtiness with tiny overlay deltas (no deepcopy)
+        def p_dirty_local(x, y, a_delta, b_delta, lv_delta, sim_time):
+            a = self.belief.alpha[x, y] + a_delta.get((x, y), 0)
+            b = self.belief.beta[x, y] + b_delta.get((x, y), 0)
+            e = (a / (a + b)) if (a + b) > 0 else 0.5
+            lv = lv_delta.get((x, y), self.belief.last_visit[x, y])
+            dt = sim_time - lv
+            if dt < 0: dt = 0
+            w = 1.0 - np.exp(-dt / max(self.belief.decay_const, 1e-9))
+            p = w * e
+            # clamp
+            if p < 0.0:
+                p = 0.0
+            elif p > 1.0:
+                p = 1.0
+            return p
+
+        # one rollout from a first-step (nx, ny)
+        def rollout_from(nx, ny):
+            a_delta, b_delta, lv_delta = {}, {}, {}  # tiny per-rollout overlays
+            sim_time = int(self.belief.current_step)
+            x, y = nx, ny
+            cum, gamma = 0.0, 1.0
+
+            for _ in range(horizon):
+                # observe at (x,y)
+                p = p_dirty_local(x, y, a_delta, b_delta, lv_delta, sim_time)
+                dirty = (rng.rand() < p)
+
+                # reward
+                step_r = (self.reward_scale if dirty else 0.0) - self.move_cost
+                cum += gamma * step_r
+
+                # local belief update overlays
+                if dirty:
+                    a_delta[(x, y)] = a_delta.get((x, y), 0) + 1
+                else:
+                    b_delta[(x, y)] = b_delta.get((x, y), 0) + 1
+                lv_delta[(x, y)] = sim_time + 1
+
+                # next move (probability matching on neighbors)
+                nbr = nbrs(x, y)
+                if not nbr: break
+                probs = np.asarray([p_dirty_local(xx, yy, a_delta, b_delta, lv_delta, sim_time) for (xx, yy) in nbr],
+                                   float)
+                s = probs.sum()
+                if s <= 1e-12:
+                    k = rng.randint(len(nbr))
+                else:
+                    probs /= s
+                    k = rng.choice(len(nbr), p=probs)
+                x, y = nbr[k]
+
+                sim_time += 1
+                gamma *= discount
+
+            return cum
+
+        # evaluate each legal first move with equal rollouts; no UCB
+        stats = []
+        for dx, dy in actions:
+            nx, ny = self.x + dx, self.y + dy
+            if not (0 <= nx < H and 0 <= ny < W):
+                continue
+
+            total = 0.0
+            for _ in range(n_sim):
+                total += rollout_from(nx, ny)
+            mean_return = total / n_sim if n_sim > 0 else -np.inf
+
+            # citable count-based visit bonus
+            v = self.visit_count[nx, ny]
+            visit_bonus = alpha_visit / (1.0 + v)
+            score = mean_return + visit_bonus
+
+            stats.append((nx, ny, mean_return, score))
+
+        if not stats:
+            return (self.x, self.y), (self.x, self.y, 0.0, 0.0)
+
+        # ε-tie band + same-direction tie-break
+        best = max(stats, key=lambda t: t[3])
+        eps = 0.02
+        candidates = [a for a in stats if abs(a[3] - best[3]) < eps] or [best]
+
+        chosen = candidates[0]
+        for a in candidates:
+            if (a[0] - self.x, a[1] - self.y) == self.last_move:
+                chosen = a
+                break
+
+        best_action = (chosen[0], chosen[1])
+        self.last_move = (best_action[0] - self.x, best_action[1] - self.y)
+        return best_action, chosen
+
     def monte_carlo_action_ucb_adaptive(
             self,
             budget=200,  # total rollout budget (across all first-step actions)
             base_horizon=5,
             discount=0.95,
-            c_ucb=1.5,
-            eta_visit=1.0,  # visit shaping strength (potential-based)
-            eps=0.10,  # ε-greedy inside rollout
-            temp_minmax=(0.5, 2.0),  # softmax temperature bounds
+            c_ucb=1.0,
+            eta_visit=0.0,  # visit shaping strength (potential-based)
+            eps=0.0,  # ε-greedy inside rollout
+            temp_minmax=(1.0, 1.0),  # softmax temperature bounds
     ):
         """
         Monte-Carlo action selection with *adaptive* UCB allocation and low-variance rollouts.
@@ -513,7 +649,8 @@ class Robot:
                 n = counts[(nx, ny)]
                 cb = c_ucb * np.sqrt(logN / n)
                 # add a light *static* visit encouragement only at root
-                score = means[(nx, ny)] + cb + eta_visit / (1.0 + self.visit_count[nx, ny])
+                # score = means[(nx, ny)] + cb + eta_visit / (1.0 + self.visit_count[nx, ny])
+                score = means[(nx, ny)] + cb
                 scores.append((score, nx, ny))
             _, ax, ay = max(scores, key=lambda t: t[0])
 
@@ -544,11 +681,12 @@ class Robot:
         # nx, ny, exp_return = *self.monte_carlo_action(horizon, n_sim, discount)[0], 0
         # (nx, ny), exp_return = self.monte_carlo_action_ucb_3(horizon, n_sim, discount)
         # (nx, ny), exp_return = self.monte_carlo_action_ucb_adaptive(horizon, n_sim, discount)
-        (nx, ny), dbg = self.monte_carlo_action_ucb_adaptive(
-            budget=n_sim * 4,  # or whatever budget you prefer
-            base_horizon=horizon,
-            discount=discount
-        )
+        # (nx, ny), dbg = self.monte_carlo_action_ucb_adaptive(
+        #     budget=n_sim * 4,  # or whatever budget you prefer
+        #     base_horizon=horizon,
+        #     discount=discount
+        # )
+        (nx, ny), exp_return = self.monte_carlo_action_ucb_3_fast(horizon, n_sim, discount)
         self.x, self.y = nx, ny
         obs = self.env.observe(nx, ny)
         self.observe_and_clean(nx, ny)

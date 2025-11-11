@@ -1,7 +1,7 @@
 import numpy as np
 
 class BeliefGrid:
-    def __init__(self, n, m, alpha_init=1.0, beta_init=1.0, decay_const = 10):
+    def __init__(self, n, m, alpha_init=1.0, beta_init=1.0, decay_const = 20):
         self.rows = n
         self.cols = m
         self.alpha = np.full((n, m), alpha_init)
